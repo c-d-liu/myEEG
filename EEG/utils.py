@@ -1,14 +1,22 @@
 # load iEEG data in an object
+import os
+USE_GPU = os.environ.get("USE_GPU", "0") == "1"
+
 import mne
 import pandas as pd
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.linear_model import Ridge
-from sklearn.metrics import r2_score, mean_squared_error
+if USE_GPU:
+    from cuml.linear_model import Ridge
+    from cuml.metrics import r2_score, mean_squared_error
+    print("🟢 Running on GPU (cuML)")
+else:
+    from sklearn.linear_model import Ridge
+    print("🔴 Running on CPU (scikit-learn)")
+    from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.model_selection import StratifiedKFold
-import os
 import re
 from pprint import pprint
 
@@ -250,10 +258,20 @@ class EEGData:
         print("Best alpha for the model:", alphas)
         return RidgeModel(weights, self.sampf, alphas, best_r2, Xshape, submatrix.window_before, submatrix.window_after, features=features, channels=self.channels)
 
+    def permute_column(self, column: str) -> None:
+        """Permute non-zero values in a column in the data."""
+        if column not in self.data.columns:
+            raise ValueError(f"Column {column} not found in data.")
+        non_zero_mask = self.data[column] != 0
+        self.data.loc[non_zero_mask, column] = np.random.permutation(self.data.loc[non_zero_mask, column].values)
 
-def read_fif(path: str, sampf: int = sampf, margin: float|int = margin, silence: float = silence, samples_per_bin: int = samples_per_bin, block: int = 1, exclude = ['bad_interruption']) -> EEGData:
+
+def read_fif(path: str, sampf: int = sampf, margin: float|int = margin, silence: float = silence, samples_per_bin: int = samples_per_bin, block: int = 1, exclude = ['bad_interruption'],
+             tmax: float|int|None = None) -> EEGData:
     onset = margin + silence
     raw: mne.io.Raw = mne.io.read_raw_fif(path, preload=True)
+    if tmax is not None:
+        raw.crop(tmax=tmax)
     df = raw.resample(sampf).to_data_frame()
     df.iloc[:,1:] = df.iloc[:,1:].apply(lambda x: (x - x.mean()) / x.std(), axis=0) # z-score the data
     df['block'] = block
@@ -288,8 +306,10 @@ def read_fif(path: str, sampf: int = sampf, margin: float|int = margin, silence:
         exclude_intervals.extend(intervals) 
     for start, end in exclude_intervals:
         exclude_mask = np.logical_or(exclude_mask, (time_array >= start) & (time_array <= end))
-    df = df[~exclude_mask] # exclude exclude intervals
-    
+    df = df[~exclude_mask].reset_index(drop=True) # exclude exclude intervals
+    # Recalculate time to be continuous
+    df['time'] = np.arange(len(df)) / sampf
+
     channels = df.columns.tolist()
     print("Channels loaded:", channels)
     channels.remove('time')
@@ -517,91 +537,134 @@ def stratified_group_kfold(blocks, groups, n_splits=5, random_state=None):
 
         yield np.where(train_mask)[0], np.where(test_mask)[0]
 
-def ridge_cv_stratified_group(X, y, blocks, groups, alphas, n_splits=5, random_state=None):
+# Helper function to safely move CuPy arrays to CPU 
+# without crashing if they are already NumPy arrays.
+def to_cpu(obj):
+    if hasattr(obj, 'get'):
+        return obj.get()
+    return np.asarray(obj)
+
+def ridge_cv_stratified_group(X, y, blocks, groups, alphas, n_splits=5, random_state=None,
+                              USE_GPU=USE_GPU, optimize_alpha=False):
+    # use this function to pass a single alpha value to just fit a model with fixed alpha,
+    # or a list of alpha values to fit the model and find the best alpha per channel
+    # it is not possible to pass per channel alpha values
     X = np.asarray(X)
     y = np.asarray(y)
     assert len(X) == len(y) == len(blocks) == len(groups), f"X, y, blocks, and groups must have the same length.\nFound {(len(X), len(y), len(blocks), len(groups))}"
     results = {"alpha": [], "mean_r2": [], "mean_mse": [], "fold_scores": {}, "models": {}, "mean_r2_channels": {}}
 
-    for alpha in alphas:
-        print(f"Testing alpha: {alpha}")
-        r2_scores, mse_scores, fold_models = [], [], []
+    if optimize_alpha:
+        for alpha in alphas:
+            print(f"Testing alpha: {alpha}")
+            r2_scores, mse_scores, fold_models = [], [], []
 
+            for train_idx, test_idx in stratified_group_kfold(blocks, groups,
+                                                            n_splits=n_splits,
+                                                            random_state=random_state):
+                if USE_GPU:
+                    model = Ridge(alpha=alpha, solver='lsmr')
+                else:
+                    model = Ridge(alpha=alpha)
+                model.fit(X[train_idx], y[train_idx])
+                y_pred = model.predict(X[test_idx])
+
+                r2_scores.append(r2_score(y[test_idx], y_pred, multioutput="raw_values"))
+                mse_scores.append(mean_squared_error(y[test_idx], y_pred))
+                #pearson = np.corrcoef(y[test_idx].T, y_pred.T).diagonal(offset=y.shape[1])
+                fold_models.append(model)
+
+            r2_scores = np.stack(r2_scores, axis=0)   # shape: [n_folds, n_channels]
+            mean_r2_channels = np.mean(r2_scores, axis=0)  # shape: [n_channels]
+
+            results["alpha"].append(alpha)
+            results["mean_r2"].append(np.mean(mean_r2_channels)) # global average
+            results["mean_mse"].append(np.mean(mse_scores))
+            results["fold_scores"][alpha] = {
+                "r2": r2_scores,   # shape [n_folds, n_channels]
+                "mse": mse_scores
+            }
+            results["models"][alpha] = fold_models  # store all models for this alpha
+            results["mean_r2_channels"][alpha] = mean_r2_channels        # per channel
+
+        # ------------------------
+        # Select best alpha per channel
+        # ------------------------
+        all_mean_r2 = np.stack([results["mean_r2_channels"][a] for a in alphas], axis=0)  # [n_alphas, n_targets]
+        best_alpha_indices = np.argmax(all_mean_r2, axis=0)
+        best_alpha_per_channel = np.array([alphas[i] for i in best_alpha_indices])
+        best_r2_per_channel = np.max(all_mean_r2, axis=0)
+        
+        # ------------------------
+        # Compute average model coefficients for each target
+        # ------------------------
+        # Average coefficients across folds for each alpha
+        avg_coefs_per_alpha = {}
+        for alpha in alphas:
+            fold_coefs = np.stack([m.coef_ for m in results["models"][alpha]], axis=0)  # [n_folds, n_targets, n_features]
+            avg_coefs_per_alpha[alpha] = np.mean(fold_coefs, axis=0)  # [n_targets, n_features]
+
+        # Select the coefficient row for each target using its best alpha
+        n_targets, n_features = y.shape[1], X.shape[1]
+        avg_coefs_best = np.zeros((n_targets, n_features))
+        for t in range(n_targets):
+            alpha_t = best_alpha_per_channel[t]
+            avg_coefs_best[t] = avg_coefs_per_alpha[alpha_t][t]
+
+        results["avg_coefs_best"] = avg_coefs_best  # [n_targets, n_features]
+
+
+        ## Optionally, compute the mean intercepts
+        #avg_intercepts_per_alpha = {
+        #    alpha: np.mean([m.intercept_ for m in results["models"][alpha]], axis=0)
+        #    for alpha in alphas
+        #}
+        #avg_intercepts_best = np.array([
+        #    avg_intercepts_per_alpha[best_alpha_per_channel[t]][t]
+        #    for t in range(n_targets)
+        #])
+        #results["avg_intercepts_best"] = avg_intercepts_best
+
+        if USE_GPU:
+            # store in cpu
+            avg_coefs_best = to_cpu(avg_coefs_best)
+            best_alpha_per_channel = to_cpu(best_alpha_per_channel)
+            best_r2_per_channel = to_cpu(best_r2_per_channel)
+
+        return avg_coefs_best, best_alpha_per_channel, best_r2_per_channel
+
+    else:
+        if len(alphas) == 1:
+            print(f"Using fixed alpha: {alphas[0]}")
+            alphas = alphas * y.shape[1]  # replicate the single alpha for all channels
+        else:
+            assert len(alphas) == y.shape[1], "If optimize_alpha is False, the length of alphas must match the number of channels in y"
+        r2_scores, mse_scores, fold_models = [], [], []
         for train_idx, test_idx in stratified_group_kfold(blocks, groups,
-                                                          n_splits=n_splits,
-                                                          random_state=random_state):
-            model = Ridge(alpha=alpha)
+                                                            n_splits=n_splits,
+                                                            random_state=random_state):
+            if USE_GPU:
+                model = Ridge(alpha=alphas, solver='lsmr')
+            else:
+                model = Ridge(alpha=alphas)
             model.fit(X[train_idx], y[train_idx])
             y_pred = model.predict(X[test_idx])
-
             r2_scores.append(r2_score(y[test_idx], y_pred, multioutput="raw_values"))
             mse_scores.append(mean_squared_error(y[test_idx], y_pred))
-            #pearson = np.corrcoef(y[test_idx].T, y_pred.T).diagonal(offset=y.shape[1])
             fold_models.append(model)
-
         r2_scores = np.stack(r2_scores, axis=0)   # shape: [n_folds, n_channels]
         mean_r2_channels = np.mean(r2_scores, axis=0)  # shape: [n_channels]
+        avg_coefs_best = np.mean(np.stack([m.coef_ for m in fold_models], axis=0), axis=0)  # shape: [n_channels, n_features]
 
-        results["alpha"].append(alpha)
-        results["mean_r2"].append(np.mean(mean_r2_channels)) # global average
-        results["mean_mse"].append(np.mean(mse_scores))
-        results["fold_scores"][alpha] = {
-            "r2": r2_scores,   # shape [n_folds, n_channels]
-            "mse": mse_scores
-        }
-        results["models"][alpha] = fold_models  # store all models for this alpha
-        results["mean_r2_channels"][alpha] = mean_r2_channels        # per channel
+        best_alpha_per_channel = alphas
 
-    ## Pick best alpha by mean r2
-    #best_idx = np.argmax(results["mean_r2"])
-    #best_alpha = results["alpha"][best_idx]
-    #best_r2 = results["mean_r2_channels"][best_alpha]
-    #results["best_alpha"] = best_alpha
+        if USE_GPU:
+            avg_coefs_best = to_cpu(avg_coefs_best)
+            alphas = to_cpu(alphas)
+            mean_r2_channels = to_cpu(mean_r2_channels)
+        
+        return avg_coefs_best, alphas, mean_r2_channels
 
-    ## Instead of retraining on all data, just return the models trained in CV
-    #best_models = results["models"][best_alpha]
-
-    #return results, best_models, best_r2
-
-    # ------------------------
-    # Select best alpha per channel
-    # ------------------------
-    all_mean_r2 = np.stack([results["mean_r2_channels"][a] for a in alphas], axis=0)  # [n_alphas, n_targets]
-    best_alpha_indices = np.argmax(all_mean_r2, axis=0)
-    best_alpha_per_channel = np.array([alphas[i] for i in best_alpha_indices])
-    best_r2_per_channel = np.max(all_mean_r2, axis=0)
-    
-    # ------------------------
-    # Compute average model coefficients for each target
-    # ------------------------
-    # Average coefficients across folds for each alpha
-    avg_coefs_per_alpha = {}
-    for alpha in alphas:
-        fold_coefs = np.stack([m.coef_ for m in results["models"][alpha]], axis=0)  # [n_folds, n_targets, n_features]
-        avg_coefs_per_alpha[alpha] = np.mean(fold_coefs, axis=0)  # [n_targets, n_features]
-
-    # Select the coefficient row for each target using its best alpha
-    n_targets, n_features = y.shape[1], X.shape[1]
-    avg_coefs_best = np.zeros((n_targets, n_features))
-    for t in range(n_targets):
-        alpha_t = best_alpha_per_channel[t]
-        avg_coefs_best[t] = avg_coefs_per_alpha[alpha_t][t]
-
-    results["avg_coefs_best"] = avg_coefs_best  # [n_targets, n_features]
-
-
-    ## Optionally, compute the mean intercepts
-    #avg_intercepts_per_alpha = {
-    #    alpha: np.mean([m.intercept_ for m in results["models"][alpha]], axis=0)
-    #    for alpha in alphas
-    #}
-    #avg_intercepts_best = np.array([
-    #    avg_intercepts_per_alpha[best_alpha_per_channel[t]][t]
-    #    for t in range(n_targets)
-    #])
-    #results["avg_intercepts_best"] = avg_intercepts_best
-
-    return results['avg_coefs_best'], best_alpha_per_channel, best_r2_per_channel
 
 def load_batch(eeg_dir, feature_dir, sampf, margin, silence, samples_per_bin, categorical = ['miscOnsets', 'textPredicted', 'predictedWord']):
     '''Legacy function.
@@ -644,8 +707,8 @@ def load_batch(eeg_dir, feature_dir, sampf, margin, silence, samples_per_bin, ca
 def load_subject(eeg_dir, sampf: int, margin: float, silence: float, samples_per_bin: int, feature_dir: str = 'stimulus_features', categorical_dir: str = 'stimulus_features_categorical',
                  pattern: str = r'([a-zA-z]+)\d*_\d\.csv', eegpattern: str = r'.+_(\d+)\.fif',
                  preloaded: bool = False, preloaded_cont: dict = {},  # {block_num: {name: DataFrame}}
-                 preloaded_cat: dict = {}  # {block_num: {name: DataFrame}}
-                 ):
+                 preloaded_cat: dict = {},  # {block_num: {name: DataFrame}}
+                 blocks = [1,2,3,4], tmax: float|int|dict|None = None):
     '''Load a batch of EEG data and corresponding features from directories.
     Concatenate them into a single EEGData object.
     eeg_dir: directory containing .fif files. Should be named as 'subj_block.fif', e.g. KEH001_1.fif
@@ -659,8 +722,13 @@ def load_subject(eeg_dir, sampf: int, margin: float, silence: float, samples_per
     eegpattern: regex pattern to extract block number from eeg filename
     preloaded: whether to use preloaded features
     preloaded_cont: dict of preloaded continuous features per block
-    preloaded_cat: dict of preloaded categorical features per block'''
-    featuref = os.listdir(feature_dir)
+    preloaded_cat: dict of preloaded categorical features per block
+    blocks: list of block numbers to load
+    '''
+    if preloaded:
+        featuref = []
+    else:
+        featuref = os.listdir(feature_dir)
     eegf = [f for f in os.listdir(eeg_dir) if f.endswith('.fif')]
     def extract_num(f):
         m = re.match(eegpattern, f)
@@ -668,10 +736,20 @@ def load_subject(eeg_dir, sampf: int, margin: float, silence: float, samples_per
             return int(m.group(1))
         else:
             raise ValueError(f"Filename {f} does not match pattern")
-    eegf = sorted(eegf, key=extract_num)
+    eeg_dict = {}
+    for f in eegf:
+        block_num = extract_num(f)
+        if block_num in blocks:
+            eeg_dict[block_num] = f
+        else:
+            print(f"Skipping block {block_num} in {f} not in {blocks}")
     eeglist = []
-    for i in range(1, len(eegf)+1):
-        eeg = read_fif(path = os.path.join(eeg_dir, eegf[i-1]), sampf=sampf, margin=margin, silence=silence, samples_per_bin=samples_per_bin, block=i)
+    for i in blocks:
+        if isinstance(tmax, dict):
+            tmax_block = tmax.get(i, None)
+        else:
+            tmax_block = tmax
+        eeg = read_fif(path = os.path.join(eeg_dir, eeg_dict[i]), sampf=sampf, margin=margin, silence=silence, samples_per_bin=samples_per_bin, block=i, tmax=tmax_block)
         # load continuous features
         if preloaded:
             if i in preloaded_cont:
@@ -792,6 +870,34 @@ def load_dataset(dataset_dir, sampf: int, margin: float, silence: float, samples
             eeg = load_subject(eeg_dir=eeg_dir, sampf=sampf, margin=margin, silence=silence, samples_per_bin=samples_per_bin, feature_dir=feature_dir, categorical_dir=categorical_dir, pattern=pattern, eegpattern=eegpattern)
         eeglist.append(eeg)
     return eeglist
+
+def merge_subjects(eeglist):
+    '''Merge a list of EEGData objects horizontally into a single EEGData object.
+    EEGData objects must have the same number of samples and the same time vector.
+    Channel names are modified to include the subject ID to avoid duplicates.
+    Only EEG channels are merged. Features of the first EEGData object are kept.
+    eeglist: list of EEGData objects'''
+    if len(eeglist) == 0:
+        raise ValueError("eeglist is empty")
+    elif len(eeglist) == 1:
+        return eeglist[0]
+    else:
+        assert all(np.array_equal(eeg.data['time'], eeglist[0].data['time']) for eeg in eeglist), "All EEGData objects must have the same time vector"
+        eegs = eeglist.copy()
+        # change channel names to include subject ID
+        for eeg in eegs:
+            for i, ch in enumerate(eeg.channels):
+                eeg.channels[i] = f"{eeg.subject}_{ch}"
+                eeg.data.rename(columns={ch: f"{eeg.subject}_{ch}"}, inplace=True)
+        # concatenate data horizontally
+        merged_eeg = eegs[0]
+        for eeg in eegs[1:]:
+            merged_data = pd.concat([merged_eeg.data, eeg.data[eeg.channels]], axis=1)
+            merged_eeg.data = merged_data
+            merged_eeg.channels += eeg.channels
+            merged_eeg.subject += f"_{eeg.subject}"
+
+        return merged_eeg
 
 class RidgeModel:
     def __init__(self, weights, sampf, alphas, r2, Xshape: list[int], window_before: int, window_after: int, features: list[str] | None = None, channels: list[str] | None = None,) -> None:
@@ -1018,13 +1124,15 @@ class RidgeModel:
         '''Return a dict of TRF matrices for all channels, keyed by channel name.'''
         n_lags = self.Xs
         weights = self.weights  # [n_channels, n_features]
+        if weights.ndim == 1:
+            weights = weights.reshape(1, -1)  # Ensure 2D shape for single channel
         if self.features is None:
             predictor_names = [f'feature_{i}' for i in range(len(n_lags))]
         else:
             predictor_names = self.features
         # Total number of predictors
         n_features = len(n_lags)
-        assert n_features == len(predictor_names)
+        #assert n_features == len(predictor_names)
         if self.channels is None:
             channels = [f'channel_{i}' for i in range(weights.shape[0])]
         else:
