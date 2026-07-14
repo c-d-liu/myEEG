@@ -729,7 +729,7 @@ def load_subject(eeg_dir, sampf: int, margin: float, silence: float, samples_per
         featuref = []
     else:
         featuref = os.listdir(feature_dir)
-    eegf = [f for f in os.listdir(eeg_dir) if f.endswith('.fif')]
+    eegf = [f for f in os.listdir(eeg_dir) if f.endswith('.fif') and (not f.startswith('._'))]  # skip hidden files
     def extract_num(f):
         m = re.match(eegpattern, f)
         if m:
