@@ -271,6 +271,7 @@ def read_fif(path: str, sampf: int = sampf, margin: float|int = margin, silence:
              tmax: float|int|None = None) -> EEGData:
     onset = margin + silence
     raw: mne.io.Raw = mne.io.read_raw_fif(path, preload=True)
+    first_time = raw.first_time
     if tmax is not None:
         raw.crop(tmax=tmax)
     df = raw.resample(sampf).to_data_frame()
@@ -282,9 +283,12 @@ def read_fif(path: str, sampf: int = sampf, margin: float|int = margin, silence:
     # Mark bad intervals
     bads = [anno for anno in raw.annotations if anno['description'].lower().startswith('bad')]
     bad_intervals = [(anno['onset'], anno['onset'] + anno['duration']) for anno in bads]
-    #print(f"Found {len(bad_intervals)} bad intervals in {path}")
-    #pprint("Bad intervals:")
-    #pprint(bad_intervals)
+    bad_intervals = [(start-first_time, end-first_time) for start, end in bad_intervals] # adjust to first_time
+    print(f"Found {len(bad_intervals)} bad intervals in {path}")
+    pprint("Bad intervals:")
+    pprint(bad_intervals)
+    if any(end - start <= 1/sampf for start, end in bad_intervals):
+        print("Warning: Found bad intervals with duration <= 1/sampf. It might be ignored.")
     def mark_bad(time, bad_intervals=bad_intervals):
         return any(start <= time <= end for start, end in bad_intervals)
     # After optimization:
@@ -302,8 +306,8 @@ def read_fif(path: str, sampf: int = sampf, margin: float|int = margin, silence:
     for ex in exclude:
         annos = [anno for anno in raw.annotations if anno['description'].lower() == ex.lower()]
         for a in annos:
-            print(f"Bad interval for {ex}: onset={a['onset']}, duration={a['duration']}")
-        intervals = [(anno['onset'], anno['onset'] + anno['duration']) for anno in annos]
+            print(f"Bad interval for {ex}: onset={a['onset']-first_time}, duration={a['duration']}")
+        intervals = [(anno['onset']-first_time, anno['onset'] + anno['duration']-first_time) for anno in annos]
         exclude_intervals.extend(intervals) 
     for start, end in exclude_intervals:
         exclude_mask = np.logical_or(exclude_mask, (time_array >= start) & (time_array <= end))
@@ -434,7 +438,7 @@ def make_lagged_matrix(df, cols, sampf, window_before=1.0, window_after=0.2, bad
     cols = [c for c in cols if c != 'block'] + ['block']
     assert pd.Series(cols).is_unique, "Duplicate features exist"
     bad_cols = [c for c in df.columns if re.match(bad_pattern, c)] # columns marking bad segments
-    if bad_cols:
+    if bad_cols and np.any(df[bad_cols].sum(axis=1) > 0):
         print("Found bad segments in", bad_cols)
         cols += bad_cols
 
@@ -457,11 +461,14 @@ def make_lagged_matrix(df, cols, sampf, window_before=1.0, window_after=0.2, bad
     blocks = matrix[:, col_map['block']]
     #assert np.all(np.unique(blocks) == np.array([1., 2., 3.])) or np.all(np.unique(blocks) == np.array([1., 2., 3., 4.]))
     mask = np.all(blocks == blocks[:, [0]], axis=1) # keep only rows where block is consistent
-    print(f"Found {np.sum(~mask)} samples crossing block boundaries.")
+    n_samples_crossing = np.sum(~mask)
+    print(f"Found {n_samples_crossing} samples crossing block boundaries.")
     if bad_cols:
         for bad_col in bad_cols:
             bad_values = matrix[:, col_map[bad_col]]
             mask = mask & (bad_values.sum(axis=1) == 0)  # exclude rows with any bad values
+        n_samples_bad = np.sum(~mask) - n_samples_crossing
+        print(f"Found {n_samples_bad} samples with bad values.")
 
     # Return lagged values in order of `cols`
     lagged_list = [matrix[:, col_map[c]] for c in cols if c != 'block' and c not in bad_cols]
