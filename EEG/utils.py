@@ -236,7 +236,7 @@ class EEGData:
 
         return X
 
-    def fit_ridge_regression(self, features: list, alphas: list[float] = [1000], n_splits: int = 10, random_state=42) -> "RidgeModel":
+    def fit_ridge_regression(self, features: list, alphas: list[float] = [1000], n_splits: int = 10, random_state=42, optimize_alpha: bool = False) -> "RidgeModel":
         """Fit ridge regression model."""
         if self.matrix is None:
             self.prepareTRF(features)
@@ -253,7 +253,8 @@ class EEGData:
             X, y, blocks, groups,
             alphas=alphas,
             n_splits=n_splits,
-            random_state=random_state
+            random_state=random_state,
+            optimize_alpha=optimize_alpha
         )
         print("Best alpha for the model:", alphas)
         return RidgeModel(weights, self.sampf, alphas, best_r2, Xshape, submatrix.window_before, submatrix.window_after, features=features, channels=self.channels)
@@ -306,9 +307,9 @@ def read_fif(path: str, sampf: int = sampf, margin: float|int = margin, silence:
         exclude_intervals.extend(intervals) 
     for start, end in exclude_intervals:
         exclude_mask = np.logical_or(exclude_mask, (time_array >= start) & (time_array <= end))
-    df = df[~exclude_mask].reset_index(drop=True) # exclude exclude intervals
-    # Recalculate time to be continuous
-    df['time'] = np.arange(len(df)) / sampf
+    
+    # DO NOT DROP INDEX. IT CHANGES ALIGNMENT.
+    df = df[~exclude_mask] # exclude exclude intervals
 
     channels = df.columns.tolist()
     print("Channels loaded:", channels)
