@@ -603,7 +603,7 @@ def ridge_cv_stratified_group(X, y, blocks, groups, alphas, n_splits=5, random_s
         # ------------------------
         all_mean_r2 = np.stack([results["mean_r2_channels"][a] for a in alphas], axis=0)  # [n_alphas, n_targets]
         best_alpha_indices = np.argmax(all_mean_r2, axis=0)
-        best_alpha_per_channel = np.array([alphas[i] for i in best_alpha_indices])
+        best_alpha_per_channel = np.array(alphas)[best_alpha_indices]
         best_r2_per_channel = np.max(all_mean_r2, axis=0)
         
         # ------------------------
