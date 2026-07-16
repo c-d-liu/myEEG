@@ -439,8 +439,11 @@ def make_lagged_matrix(df, cols, sampf, window_before=1.0, window_after=0.2, bad
     assert pd.Series(cols).is_unique, "Duplicate features exist"
     bad_cols = [c for c in df.columns if re.match(bad_pattern, c)] # columns marking bad segments
     if bad_cols and np.any(df[bad_cols].sum(axis=1) > 0):
+        BAD_EXIST = True
         print("Found bad segments in", bad_cols)
         cols += bad_cols
+    else:
+        BAD_EXIST = False
 
     # Select relevant columns
     dfs = df[cols]
@@ -463,7 +466,7 @@ def make_lagged_matrix(df, cols, sampf, window_before=1.0, window_after=0.2, bad
     mask = np.all(blocks == blocks[:, [0]], axis=1) # keep only rows where block is consistent
     n_samples_crossing = np.sum(~mask)
     print(f"Found {n_samples_crossing} samples crossing block boundaries.")
-    if bad_cols:
+    if BAD_EXIST:
         for bad_col in bad_cols:
             bad_values = matrix[:, col_map[bad_col]]
             mask = mask & (bad_values.sum(axis=1) == 0)  # exclude rows with any bad values
