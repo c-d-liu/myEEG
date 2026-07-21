@@ -2,7 +2,6 @@
 import os
 USE_GPU = os.environ.get("USE_GPU", "0") == "1"
 
-import mne
 import pandas as pd
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -19,6 +18,7 @@ else:
 from sklearn.model_selection import StratifiedKFold
 import re
 from pprint import pprint
+from mne.io import read_raw_fif, Raw
 
 sampf = 120
 margin = 2 # seconds
@@ -270,7 +270,7 @@ class EEGData:
 def read_fif(path: str, sampf: int = sampf, margin: float|int = margin, silence: float = silence, samples_per_bin: int = samples_per_bin, block: int = 1, exclude = ['bad_interruption'],
              tmax: float|int|None = None) -> EEGData:
     onset = margin + silence
-    raw: mne.io.Raw = mne.io.read_raw_fif(path, preload=True)
+    raw: Raw = read_raw_fif(path, preload=True)
     first_time = raw.first_time
     if tmax is not None:
         raw.crop(tmax=tmax)
@@ -603,6 +603,8 @@ def ridge_cv_stratified_group(X, y, blocks, groups, alphas, n_splits=5, random_s
         # ------------------------
         all_mean_r2 = np.stack([results["mean_r2_channels"][a] for a in alphas], axis=0)  # [n_alphas, n_targets]
         best_alpha_indices = np.argmax(all_mean_r2, axis=0)
+        alphas = to_cpu(alphas)
+        best_alpha_indices = to_cpu(best_alpha_indices)
         best_alpha_per_channel = np.array(alphas)[best_alpha_indices]
         best_r2_per_channel = np.max(all_mean_r2, axis=0)
         
@@ -663,6 +665,7 @@ def ridge_cv_stratified_group(X, y, blocks, groups, alphas, n_splits=5, random_s
             r2_scores.append(r2_score(y[test_idx], y_pred, multioutput="raw_values"))
             mse_scores.append(mean_squared_error(y[test_idx], y_pred))
             fold_models.append(model)
+        
         r2_scores = np.stack(r2_scores, axis=0)   # shape: [n_folds, n_channels]
         mean_r2_channels = np.mean(r2_scores, axis=0)  # shape: [n_channels]
         avg_coefs_best = np.mean(np.stack([m.coef_ for m in fold_models], axis=0), axis=0)  # shape: [n_channels, n_features]
