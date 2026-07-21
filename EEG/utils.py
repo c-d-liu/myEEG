@@ -799,7 +799,8 @@ def load_subject(eeg_dir, sampf: int, margin: float, silence: float, samples_per
 def load_subject_podcast(eeg_dir, sampf: int, margin: float, silence: float, samples_per_bin: int, feature_dir: str = 'stimulus_features', categorical_dir: str = 'stimulus_features_categorical',
                  pattern: str = r'([a-zA-z]+)\d*_\d\.csv', eegpattern: str = r'.+_(\d+)\.fif',
                  preloaded: bool = False, preloaded_cont: dict = {},  # {block_num: {name: DataFrame}}
-                 preloaded_cat: dict = {}  # {block_num: {name: DataFrame}}
+                 preloaded_cat: dict = {},  # {block_num: {name: DataFrame}}
+                 subdir = None
                  ):
     '''Load a batch of EEG data and corresponding features from directories.
     Concatenate them into a single EEGData object.
@@ -815,6 +816,8 @@ def load_subject_podcast(eeg_dir, sampf: int, margin: float, silence: float, sam
     preloaded: whether to use preloaded features
     preloaded_cont: dict of preloaded continuous features per block
     preloaded_cat: dict of preloaded categorical features per block'''
+    if subdir is not None:
+        eeg_dir = os.path.join(eeg_dir, subdir)
     eegf = [f for f in os.listdir(eeg_dir) if f.endswith('.fif')]
     eegf = [f for f in eegf if not os.path.islink(os.path.join(eeg_dir, f))]  # skip symlinks
     def extract_num(f):
