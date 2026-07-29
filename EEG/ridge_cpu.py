@@ -74,6 +74,7 @@ def fit_stratified_group_cv(X, y, blocks, groups, alphas, n_splits=5, random_sta
         if len(alphas) == 1:
             print(f"Using fixed alpha: {alphas[0]}")
             alphas = alphas * y.shape[1]  # replicate the single alpha for all channels
+            assert len(alphas) == y.shape[1], f"Unexpected shape of alphas: {alphas}, check the type of alphas"
             alphas = np.asarray(alphas)
         else:
             assert len(alphas) == y.shape[1], "If optimize_alpha is False, the length of alphas must match the number of channels in y"
