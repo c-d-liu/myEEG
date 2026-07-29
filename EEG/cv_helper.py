@@ -4,7 +4,7 @@
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from .ridge_fast_cpu import fast_ridge_rsquared, optimal_alpha_rsquared, find_optimal_alphas_vectorized
-from .core import USE_GPU
+from .utils import USE_GPU
 
 def stratified_group_kfold(blocks, groups, n_splits=5, random_state=None):
     """

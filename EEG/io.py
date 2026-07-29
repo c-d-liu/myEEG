@@ -1,7 +1,7 @@
 import os
 import re
 from mne.io import read_raw_fif
-from .core import EEGData
+from .utils import EEGData
 from pprint import pprint
 import numpy as np
 import pandas as pd
