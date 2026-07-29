@@ -251,6 +251,32 @@ class EEGData:
         non_zero_mask = self.data[column] != 0
         self.data.loc[non_zero_mask, column] = np.random.permutation(self.data.loc[non_zero_mask, column].values)
 
+    def fit_fast_ridge_regression(self, features: list, alphas: list[float] = [1000], n_splits: int = 10, random_state=42, optimize_alpha: bool = False, vectorized: bool = True) -> "RidgeModel":
+        """Fit ridge regression model using fast eigendecomposition-based R^2 computation. Returns only R^2 and best alpha per channel (if optimize_alpha=True)."""
+        if self.matrix is None:
+            self.prepareTRF(features)
+        y, y_start, y_end = self.get_y()
+        submatrix = self.matrix.subset(features)
+        predictors_map = submatrix.predictor_map
+        Xs = submatrix.lagged_list
+        Xshape = [X.shape[1] for X in Xs]
+        mask = self.matrix.mask
+        blocks = self.data['block'].iloc[y_start:y_end][mask]
+        groups = self.data['bin'].iloc[y_start:y_end][mask]
+        X = np.hstack([Xs[predictors_map[s]] for s in features])[mask]
+        result_dict = ridge_cv_stratified_group_fast(
+            X, y, blocks, groups,
+            alphas=alphas,
+            n_splits=n_splits,
+            random_state=random_state,
+            optimize_alpha=optimize_alpha,
+            vectorized=vectorized
+        )
+        best_r2 = result_dict['r2']
+        best_alphas = result_dict.get('alpha', alphas)
+        print("Best alpha for the model:", best_alphas)
+        return RidgeModel(None, self.sampf, best_alphas, best_r2, Xshape, submatrix.window_before, submatrix.window_after, features=features, channels=self.channels)
+
 def make_lagged_matrix(df, cols, sampf, window_before=1.0, window_after=0.2, bad_pattern = r'^bad'):
     """
     Create lagged values for specified columns in a dataframe using a sliding window.
