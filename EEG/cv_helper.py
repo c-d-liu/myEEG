@@ -149,7 +149,7 @@ def ridge_cv_stratified_group_fast(X, y, blocks, groups, alphas, n_splits=5, ran
 
     if optimize_alpha:
         alpha_list = list(alphas)
-        print(f"Searching for best alpha per channel from {len(alpha_list)} candidates: {alpha_list}")
+        print(f"Searching for best alpha per channel from {len(alpha_list)} candidates: {alpha_list}", flush=True)
         alpha_arr = np.array(alpha_list)
 
         if vectorized:
@@ -208,10 +208,10 @@ def ridge_cv_stratified_group_fast(X, y, blocks, groups, alphas, n_splits=5, ran
 
     else:
         if len(alphas) == 1:
-            print(f"Using fixed alpha: {alphas[0]}")
+            print(f"Using fixed alpha: {alphas[0]}", flush=True)
             alphas = list(alphas) * n_channels
         else:
-            print(f"Using fixed per-channel alphas: {alphas}")
+            print(f"Using fixed per-channel alphas: {alphas}", flush=True)
             assert len(alphas) == n_channels, \
                 "If optimize_alpha is False, the length of alphas must match the number of channels in y"
 
