@@ -14,14 +14,15 @@ samples_per_bin = sampf * 20 # 20 seconds per bin
 
 
 def read_fif(path: str, sampf: int = sampf, margin: float|int = margin, silence: float = silence, samples_per_bin: int = samples_per_bin, block: int = 1, exclude = ['bad_interruption'],
-             tmax: float|int|None = None) -> EEGData:
+             tmax: float|int|None = None, zscore: bool = True) -> EEGData:
     onset = margin + silence
     raw = read_raw_fif(path, preload=True)
     first_time = raw.first_time
     if tmax is not None:
         raw.crop(tmax=tmax)
     df = raw.resample(sampf).to_data_frame()
-    df.iloc[:,1:] = df.iloc[:,1:].apply(lambda x: (x - x.mean()) / x.std(), axis=0) # z-score the data
+    if zscore:
+        df.iloc[:,1:] = df.iloc[:,1:].apply(lambda x: (x - x.mean()) / x.std(), axis=0) # z-score the data
     df['block'] = block
     df["bin"] = df.index // samples_per_bin # create a grouping variable for shuffling
     df['onset'] = df['time'] < onset
@@ -195,7 +196,8 @@ def load_subject(eeg_dir, sampf: int, margin: float, silence: float, samples_per
                  pattern: str = r'([a-zA-z]+)\d*_\d\.csv', eegpattern: str = r'.+_(\d+)\.fif',
                  preloaded: bool = False, preloaded_cont: dict = {},  # {block_num: {name: DataFrame}}
                  preloaded_cat: dict = {},  # {block_num: {name: DataFrame}}
-                 blocks = [1,2,3,4], tmax: float|int|dict|None = None):
+                 blocks = [1,2,3,4], tmax: float|int|dict|None = None,
+                 zscore: bool = True):
     '''Load a batch of EEG data and corresponding features from directories.
     Concatenate them into a single EEGData object.
     eeg_dir: directory containing .fif files. Should be named as 'subj_block.fif', e.g. KEH001_1.fif
@@ -236,7 +238,7 @@ def load_subject(eeg_dir, sampf: int, margin: float, silence: float, samples_per
             tmax_block = tmax.get(i, None)
         else:
             tmax_block = tmax
-        eeg = read_fif(path = os.path.join(eeg_dir, eeg_dict[i]), sampf=sampf, margin=margin, silence=silence, samples_per_bin=samples_per_bin, block=i, tmax=tmax_block)
+        eeg = read_fif(path = os.path.join(eeg_dir, eeg_dict[i]), sampf=sampf, margin=margin, silence=silence, samples_per_bin=samples_per_bin, block=i, tmax=tmax_block, zscore=zscore)
         # load continuous features
         if preloaded:
             if i in preloaded_cont:
