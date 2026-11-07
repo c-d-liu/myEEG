@@ -8,7 +8,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 import matplotlib.pyplot as plt
 import numpy as np
 import re
-from .cv_helper import ridge_cv_stratified_group, ridge_cv_stratified_group_fast
+from .cv_helper import ridge_cv_stratified_group, ridge_cv_stratified_group_fast, stratified_group_kfold
 
 class EEGData:
     def __init__(self, data: pd.DataFrame, channels: list, sampf: int, margin: int | float, silence: int | float, subject = '') -> None:
@@ -250,8 +250,14 @@ class EEGData:
         non_zero_mask = self.data[column] != 0
         self.data.loc[non_zero_mask, column] = np.random.permutation(self.data.loc[non_zero_mask, column].values)
 
-    def fit_fast_ridge_regression(self, features: list, alphas: list[float] = [1000], n_splits: int = 10, random_state=42, optimize_alpha: bool = False, vectorized: bool = True) -> "RidgeModel":
-        """Fit ridge regression model using fast eigendecomposition-based R^2 computation. Returns only R^2 and best alpha per channel (if optimize_alpha=True)."""
+    def fit_fast_ridge_regression(self, features: list, alphas: list[float] = [1000], n_splits: int = 10, random_state=42, optimize_alpha: bool = False, vectorized: bool = True,
+                                  use_gpu: bool | None = None, chunk_size: int = 8192, gpu_dtype=np.float64) -> "RidgeModel":
+        """Fit ridge regression model using fast eigendecomposition-based R^2 computation. Returns only R^2 and best alpha per channel (if optimize_alpha=True).
+
+        use_gpu: run the CuPy backend. Defaults to the USE_GPU environment flag.
+        chunk_size, gpu_dtype: GPU only, see ridge_cv_stratified_group_fast."""
+        if use_gpu is None:
+            use_gpu = USE_GPU
         if self.matrix is None:
             self.prepareTRF(features)
         y, y_start, y_end = self.get_y()
@@ -269,12 +275,65 @@ class EEGData:
             n_splits=n_splits,
             random_state=random_state,
             optimize_alpha=optimize_alpha,
-            vectorized=vectorized
+            vectorized=vectorized,
+            USE_GPU=use_gpu,
+            chunk_size=chunk_size,
+            gpu_dtype=gpu_dtype,
         )
         best_r2 = result_dict['r2']
         best_alphas = result_dict.get('alpha', alphas)
         print("Best alpha for the model:", best_alphas)
         return RidgeModel(None, self.sampf, best_alphas, best_r2, Xshape, submatrix.window_before, submatrix.window_after, features=features, channels=self.channels)
+
+    def permutation_test_fast(self, features: list, permute: str | list, alphas, n_permutations: int = 1000, n_splits: int = 10, random_state=42,
+                              seed: int = 0, batch_size: int | None = None, use_gpu: bool | None = None, fit_intercept: bool = True,
+                              return_engine: bool = False) -> dict:
+        """Permutation test of one or more features in a fixed-alpha ridge TRF model.
+
+        Each permutation shuffles the values of every feature in `permute` among its events
+        (non-zero samples), independently per feature -- the same scheme as permute_column --
+        and the model with all `features` is re-evaluated with the same CV folds and alphas.
+        Only the permuted features' columns are recomputed per permutation (Schur complement
+        update, see permutation_fast.py), so this is orders of magnitude faster than refitting.
+
+        features: all features of the model (prepareTRF must have been called with them).
+        permute: feature name or list of names to permute (must be in `features`, event-like).
+        alphas: one alpha or one per channel, e.g. the alphas of the unpermuted model.
+        n_splits, random_state: CV folds, as in fit_ridge_regression / fit_fast_ridge_regression.
+        fit_intercept: True (default) reproduces fit_ridge_regression (sklearn Ridge with an
+            intercept); False reproduces fit_fast_ridge_regression (no intercept).
+        seed: seed of the permutations; use different seeds for parallel jobs.
+        batch_size: permutations evaluated at once (default: chosen from a memory budget).
+        use_gpu: run with CuPy on the GPU. Defaults to the USE_GPU environment flag.
+
+        Returns dict with r2 (observed, per channel), r2_null (n_permutations, n_channels),
+        p_values (per channel), alphas, channels, permuted, seed.
+        """
+        from .permutation_fast import FastRidgePermutation
+        if use_gpu is None:
+            use_gpu = USE_GPU
+        permute = [permute] if isinstance(permute, str) else list(permute)
+        assert all(p in features for p in permute), "every permuted feature must be in features"
+        fixed = [f for f in features if f not in permute]
+        if self.matrix is None or not all(f in self.matrix.predictors for f in features):
+            raise ValueError("Call prepareTRF() with all features first.")
+        y, y_start, y_end = self.get_y()
+        mask = self.matrix.mask
+        sub = self.matrix.subset(fixed)
+        A = np.hstack([sub.lagged_list[sub.predictor_map[s]] for s in fixed])[mask]
+        window = sub.lagged_list[0].shape[1]
+        blocks = self.data['block'].iloc[y_start:y_end][mask]
+        groups = self.data['bin'].iloc[y_start:y_end][mask]
+        folds = list(stratified_group_kfold(blocks, groups, n_splits=n_splits, random_state=random_state))
+        series = [self.data[p].to_numpy(dtype=np.float64) for p in permute]
+        engine = FastRidgePermutation(A, np.asarray(y, dtype=np.float64), np.flatnonzero(mask), series, window,
+                                      folds, alphas, fit_intercept=fit_intercept, use_gpu=use_gpu)
+        del A
+        result = engine.run(n_permutations, seed=seed, batch_size=batch_size)
+        result.update(channels=list(self.channels), permuted=permute, seed=seed)
+        if return_engine:
+            result['engine'] = engine
+        return result
 
 def make_lagged_matrix(df, cols, sampf, window_before=1.0, window_after=0.2, bad_pattern = r'^bad'):
     """

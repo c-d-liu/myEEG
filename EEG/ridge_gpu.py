@@ -7,7 +7,7 @@ import rmm
 
 rmm.statistics.enable_statistics()
 
-from .cv_helper import stratified_group_kfold
+from .cv_helper import stratified_group_kfold, to_cpu
 
 
 def fit_stratified_group_cv(X, y, blocks, groups, alphas, n_splits=5, random_state=None,
@@ -34,8 +34,9 @@ def fit_stratified_group_cv(X, y, blocks, groups, alphas, n_splits=5, random_sta
                 print(rmm.statistics.default_profiler_records.report())
                 y_pred = model.predict(X[test_idx])
 
-                r2_scores.append(r2_score(y[test_idx], y_pred, multioutput="raw_values"))
-                mse_scores.append(mean_squared_error(y[test_idx], y_pred))
+                # cuML metrics return CuPy arrays; move them to host so the NumPy code below works
+                r2_scores.append(to_cpu(r2_score(y[test_idx], y_pred, multioutput="raw_values")))
+                mse_scores.append(float(to_cpu(mean_squared_error(y[test_idx], y_pred))))
                 fold_models.append(model)
 
             r2_scores = np.stack(r2_scores, axis=0)   # shape: [n_folds, n_channels]
@@ -93,8 +94,8 @@ def fit_stratified_group_cv(X, y, blocks, groups, alphas, n_splits=5, random_sta
                 model.fit(X[train_idx], y[train_idx])
             print(rmm.statistics.default_profiler_records.report())
             y_pred = model.predict(X[test_idx])
-            r2_scores.append(r2_score(y[test_idx], y_pred, multioutput="raw_values"))
-            mse_scores.append(mean_squared_error(y[test_idx], y_pred))
+            r2_scores.append(to_cpu(r2_score(y[test_idx], y_pred, multioutput="raw_values")))
+            mse_scores.append(float(to_cpu(mean_squared_error(y[test_idx], y_pred))))
             fold_models.append(model)
 
         r2_scores = np.stack(r2_scores, axis=0)   # shape: [n_folds, n_channels]

@@ -97,8 +97,42 @@ def ridge_cv_stratified_group(X, y, blocks, groups, alphas, n_splits=5, random_s
 
     return to_cpu(avg_coefs_best), to_cpu(best_alpha_per_channel), to_cpu(best_metric_per_channel)
 
+def _ridge_cv_fast_gpu(X, y, blocks, groups, alphas, n_splits=5, random_state=None,
+                       optimize_alpha=False, chunk_size=8192, gpu_dtype=np.float64, xp=None):
+    """GPU backend of ridge_cv_stratified_group_fast (see ridge_fast_gpu). Same outputs
+    as the CPU path: mean-over-folds R^2 per channel, alpha chosen on mean CV R^2."""
+    from .ridge_fast_gpu import ridge_r2_grid_streaming
+
+    n_channels = y.shape[1]
+    if optimize_alpha:
+        alpha_arr = np.asarray(list(alphas), dtype=np.float64)
+        print(f"[GPU] Searching for best alpha per channel from {len(alpha_arr)} candidates: {list(alpha_arr)}", flush=True)
+        alpha_mat = np.broadcast_to(alpha_arr[None, :], (n_channels, len(alpha_arr)))
+    else:
+        alphas = list(alphas)
+        if len(alphas) == 1:
+            print(f"[GPU] Using fixed alpha: {alphas[0]}", flush=True)
+            alphas = alphas * n_channels
+        else:
+            print(f"[GPU] Using fixed per-channel alphas: {alphas}", flush=True)
+            assert len(alphas) == n_channels, \
+                "If optimize_alpha is False, the length of alphas must match the number of channels in y"
+        alpha_arr = np.asarray(alphas, dtype=np.float64)
+        alpha_mat = alpha_arr[:, None]
+
+    folds = list(stratified_group_kfold(blocks, groups, n_splits=n_splits, random_state=random_state))
+    r2 = ridge_r2_grid_streaming(X, y, folds, alpha_mat, chunk_size=chunk_size, dtype=gpu_dtype, xp=xp)
+    mean_r2 = r2.mean(axis=0)  # [n_channels, n_alphas]
+
+    if optimize_alpha:
+        best_idx = np.argmax(mean_r2, axis=1)
+        return {"r2": mean_r2[np.arange(n_channels), best_idx], "alpha": alpha_arr[best_idx]}
+    return {"r2": mean_r2[:, 0], "alpha": alpha_arr}
+
+
 def ridge_cv_stratified_group_fast(X, y, blocks, groups, alphas, n_splits=5, random_state=None,
-                                    USE_GPU=False, optimize_alpha=False, vectorized=True):
+                                    USE_GPU=False, optimize_alpha=False, vectorized=True,
+                                    chunk_size=8192, gpu_dtype=np.float64):
     """
     Stratified-group CV for Ridge regression using eigendecomposition-based R^2
     computation instead of fitting explicit models. Because no weight vectors are
@@ -127,7 +161,12 @@ def ridge_cv_stratified_group_fast(X, y, blocks, groups, alphas, n_splits=5, ran
             afterwards. If optimize_alpha=False, either pass a single alpha (applied to
             all channels) or one alpha per channel (len(alphas) == y.shape[1]).
         n_splits, random_state: passed to stratified_group_kfold
-        USE_GPU: if True, cast final outputs back to CPU via to_cpu()
+        USE_GPU: if True, run the CuPy backend (ridge_fast_gpu): X stays on the host and
+            is streamed to the GPU in row chunks; `vectorized` is ignored.
+        chunk_size: GPU only. Rows transferred per chunk (device memory for a chunk is
+            about chunk_size * n_features * itemsize).
+        gpu_dtype: GPU only. Computation dtype, float64 by default (float32 is faster
+            on consumer GPUs but less accurate).
         optimize_alpha: whether to search alphas and pick the best per channel
         vectorized: only relevant when optimize_alpha=True. If True, use the fully
             vectorized 3D-tensor search (find_optimal_alphas_vectorized) instead of
@@ -146,6 +185,11 @@ def ridge_cv_stratified_group_fast(X, y, blocks, groups, alphas, n_splits=5, ran
         f"X, y, blocks, and groups must have the same length.\nFound {(len(X), len(y), len(blocks), len(groups))}"
 
     n_channels = y.shape[1]
+
+    if USE_GPU:
+        return _ridge_cv_fast_gpu(X, y, blocks, groups, alphas, n_splits=n_splits,
+                                  random_state=random_state, optimize_alpha=optimize_alpha,
+                                  chunk_size=chunk_size, gpu_dtype=gpu_dtype)
 
     if optimize_alpha:
         alpha_list = list(alphas)
