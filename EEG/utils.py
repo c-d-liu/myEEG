@@ -314,8 +314,10 @@ def make_lagged_matrix(df, cols, sampf, window_before=1.0, window_after=0.2, bad
     else:
         BAD_EXIST = False
 
-    # Select relevant columns
-    dfs = df[cols]
+    # Select relevant columns. Cast to float64: the boolean 'bad' column mixed with
+    # float columns would otherwise make the matrix dtype=object, which makes the
+    # BLAS-free X.T @ X in the fast ridge path effectively never finish.
+    dfs = df[cols].astype(np.float64)
 
     # Compute window size, ensure consistency with get_y
     window = int(window_before * sampf) + int(window_after * sampf)
