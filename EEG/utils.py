@@ -287,7 +287,7 @@ class EEGData:
 
     def permutation_test_fast(self, features: list, permute: str | list, alphas, n_permutations: int = 1000, n_splits: int = 10, random_state=42,
                               seed: int = 0, batch_size: int | None = None, use_gpu: bool | None = None, fit_intercept: bool = True,
-                              return_engine: bool = False) -> dict:
+                              return_engine: bool = False, base_path: str | None = None) -> dict:
         """Permutation test of one or more features in a fixed-alpha ridge TRF model.
 
         Each permutation shuffles the values of every feature in `permute` among its events
@@ -305,6 +305,9 @@ class EEGData:
         seed: seed of the permutations; use different seeds for parallel jobs.
         batch_size: permutations evaluated at once (default: chosen from a memory budget).
         use_gpu: run with CuPy on the GPU. Defaults to the USE_GPU environment flag.
+        base_path: .npz file for the eigendecompositions of the non-permuted features
+            (see fast_base_stats); loaded if it exists, written otherwise. Lets parallel jobs
+            with different seeds share the expensive precomputation.
 
         Returns dict with r2 (observed, per channel), r2_null (n_permutations, n_channels),
         p_values (per channel), alphas, channels, permuted, seed.
@@ -315,25 +318,152 @@ class EEGData:
         permute = [permute] if isinstance(permute, str) else list(permute)
         assert all(p in features for p in permute), "every permuted feature must be in features"
         fixed = [f for f in features if f not in permute]
-        if self.matrix is None or not all(f in self.matrix.predictors for f in features):
-            raise ValueError("Call prepareTRF() with all features first.")
-        y, y_start, y_end = self.get_y()
-        mask = self.matrix.mask
-        sub = self.matrix.subset(fixed)
-        A = np.hstack([sub.lagged_list[sub.predictor_map[s]] for s in fixed])[mask]
-        window = sub.lagged_list[0].shape[1]
-        blocks = self.data['block'].iloc[y_start:y_end][mask]
-        groups = self.data['bin'].iloc[y_start:y_end][mask]
-        folds = list(stratified_group_kfold(blocks, groups, n_splits=n_splits, random_state=random_state))
+        self._check_fast_features(features)
+        base = None
+        if base_path is not None:
+            base = self.fast_base_stats(fixed, n_splits=n_splits, random_state=random_state,
+                                        fit_intercept=fit_intercept, use_gpu=use_gpu, path=base_path)
+        Y, folds = self._fast_targets_and_folds(n_splits, random_state)
+        A = self._fast_design(fixed)
         series = [self.data[p].to_numpy(dtype=np.float64) for p in permute]
-        engine = FastRidgePermutation(A, np.asarray(y, dtype=np.float64), np.flatnonzero(mask), series, window,
-                                      folds, alphas, fit_intercept=fit_intercept, use_gpu=use_gpu)
+        engine = FastRidgePermutation(A, Y, np.flatnonzero(self.matrix.mask), series, self._fast_window(),
+                                      folds, alphas, fit_intercept=fit_intercept, use_gpu=use_gpu, base=base)
         del A
         result = engine.run(n_permutations, seed=seed, batch_size=batch_size)
         result.update(channels=list(self.channels), permuted=permute, seed=seed)
         if return_engine:
             result['engine'] = engine
         return result
+
+    # ---------------------------------------------------------------- fast ablation
+    def _check_fast_features(self, features):
+        if self.matrix is None or not all(f in self.matrix.predictors for f in features):
+            raise ValueError("Call prepareTRF() with all features first.")
+
+    def _fast_window(self):
+        return self.matrix.lagged_list[0].shape[1]
+
+    def _fast_design(self, features):
+        sub = self.matrix.subset(list(features))
+        return np.hstack([sub.lagged_list[sub.predictor_map[s]] for s in features])[self.matrix.mask]
+
+    def _fast_targets_and_folds(self, n_splits, random_state):
+        y, y_start, y_end = self.get_y()
+        mask = self.matrix.mask
+        blocks = self.data['block'].iloc[y_start:y_end][mask]
+        groups = self.data['bin'].iloc[y_start:y_end][mask]
+        folds = list(stratified_group_kfold(blocks, groups, n_splits=n_splits, random_state=random_state))
+        return np.asarray(y, dtype=np.float64), folds
+
+    def _fast_base_meta(self, base_features, n_splits, random_state, fit_intercept):
+        return dict(kind='base', subject=str(self.subject), features=list(base_features), channels=list(self.channels),
+                    n_splits=int(n_splits), random_state=random_state, fit_intercept=bool(fit_intercept),
+                    sampf=float(self.sampf), window_before=float(self.matrix.window_before),
+                    window_after=float(self.matrix.window_after), n_rows=int(self.matrix.mask.sum()))
+
+    def fast_base_stats(self, base_features: list, n_splits: int = 10, random_state=42, fit_intercept: bool = True,
+                        use_gpu: bool | None = None, path: str | None = None):
+        """Per-fold eigendecompositions of the base design (the expensive, reusable part of
+        ablation_fast and permutation_test_fast), as a ridge_schur.FixedPartStats.
+
+        If `path` exists it is loaded (after checking it was made with the same features,
+        folds and settings); otherwise the statistics are computed and saved to `path`.
+        The file holds about 2 * n_splits * p^2 doubles (p = number of base columns)."""
+        from .ridge_schur import FixedPartStats
+        if use_gpu is None:
+            use_gpu = USE_GPU
+        self._check_fast_features(base_features)
+        meta = self._fast_base_meta(base_features, n_splits, random_state, fit_intercept)
+        Y, folds = self._fast_targets_and_folds(n_splits, random_state)
+        if path is not None and os.path.exists(path):
+            base = FixedPartStats.load(path, use_gpu=use_gpu)
+            if base.meta != meta:
+                raise ValueError(f"{path} was computed with different settings:\n  saved: {base.meta}\n  now:   {meta}")
+            base.check_data(Y=Y, folds=folds)
+            print(f"Loaded base statistics from {path}", flush=True)
+            return base
+        A = self._fast_design(base_features)
+        base = FixedPartStats.from_data(A, Y, folds, fit_intercept=fit_intercept, use_gpu=use_gpu, meta=meta)
+        if path is not None:
+            base.save(path)
+            print(f"Saved base statistics to {path}", flush=True)
+        return base
+
+    def fast_added_stats(self, base, added_features: list, path: str | None = None, sparse_threshold: float = 0.1):
+        """Cross products of the added features' lagged columns with the base design, the
+        targets and each other (ablation_fast.AddedFeatureStats), for all added features at once.
+
+        base: the FixedPartStats of fast_base_stats (defines the base features and folds).
+        If `path` exists it is loaded (it must belong to the same base and contain every
+        added feature); otherwise the statistics are computed and saved to `path`.
+        sparse_threshold: features whose lagged matrix is expected to have a smaller fraction
+            of non-zeros (event features) are handled as sparse matrices."""
+        from .ablation_fast import AddedFeatureStats
+        from .ridge_schur import lagged_sparse_block
+        added_features = list(added_features)
+        base_features = base.meta['features']
+        self._check_fast_features(base_features + added_features)
+        meta = dict(kind='added', base=base.meta, features=added_features)
+        if path is not None and os.path.exists(path):
+            added = AddedFeatureStats.load(path)
+            if added.meta.get('base') != base.meta or not set(added_features) <= set(added.names):
+                raise ValueError(f"{path} belongs to a different base or lacks some of {added_features} "
+                                 f"(saved: {added.meta})")
+            print(f"Loaded added-feature statistics from {path}", flush=True)
+            return added
+        mask = self.matrix.mask
+        rows = np.flatnonzero(mask)
+        window = self._fast_window()
+        blocks = {}
+        for name in added_features:
+            series = self.data[name].to_numpy(dtype=np.float64)
+            if np.count_nonzero(series) / len(series) * window < sparse_threshold:
+                blocks[name] = lagged_sparse_block(series, rows, window)
+            else:
+                blocks[name] = self.matrix.lagged_list[self.matrix.predictor_map[name]][mask]
+        Y, _ = self._fast_targets_and_folds(base.meta['n_splits'], base.meta['random_state'])
+        A = self._fast_design(base_features)
+        added = AddedFeatureStats.from_data(base, A, Y, blocks, meta=meta)
+        if path is not None:
+            added.save(path)
+            print(f"Saved added-feature statistics to {path}", flush=True)
+        return added
+
+    def ablation_fast(self, base_features: list, added_features: list, models: list | dict, alphas=None, alpha_grid=None,
+                      n_splits: int = 10, random_state=42, fit_intercept: bool = True, use_gpu: bool | None = None,
+                      base_path: str | None = None, added_path: str | None = None) -> dict:
+        """Cross-validated R^2 of several models model(base_features, *subset of added_features).
+
+        The base design is eigendecomposed once per fold (fast_base_stats), the added features'
+        cross products are computed once (fast_added_stats), and each model is then solved
+        from those with a Schur complement -- no refit, no further pass over the data. Results
+        are identical to fit_ridge_regression (fit_intercept=True) / fit_fast_ridge_regression
+        (fit_intercept=False) with the same folds and alphas.
+
+        models: list of added-feature lists, e.g. [['a','b','c'], ['a','b'], ['b','c'], ['a','c'], ['c']]
+            ([] = base alone), or a dict name -> list. Default names are 'base+a+b'.
+        alphas: fixed alpha (scalar, per channel, or dict model name -> alphas), or
+        alpha_grid: candidate alphas; the best per channel is chosen for every model.
+        base_path, added_path: .npz files for the intermediate results; loaded if they exist,
+            written otherwise. Reuse them to evaluate more models / alphas later.
+
+        Returns dict name -> RidgeModel (weights=None, r2 per channel, alphas per channel);
+        each model also has r2_folds (n_splits, n_channels).
+        """
+        from .ablation_fast import FastRidgeAblation
+        base = self.fast_base_stats(base_features, n_splits=n_splits, random_state=random_state,
+                                    fit_intercept=fit_intercept, use_gpu=use_gpu, path=base_path)
+        added = self.fast_added_stats(base, added_features, path=added_path)
+        results = FastRidgeAblation(base, added).run(models, alphas=alphas, alpha_grid=alpha_grid)
+        window = self._fast_window()
+        out = {}
+        for name, res in results.items():
+            feats = list(base_features) + res['features']
+            model = RidgeModel(None, self.sampf, res['alpha'], res['r2'], [window] * len(feats),
+                               self.matrix.window_before, self.matrix.window_after, features=feats, channels=self.channels)
+            model.r2_folds = res['r2_folds']
+            out[name] = model
+        return out
 
 def make_lagged_matrix(df, cols, sampf, window_before=1.0, window_after=0.2, bad_pattern = r'^bad'):
     """
